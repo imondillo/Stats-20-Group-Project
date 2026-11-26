@@ -1,0 +1,182 @@
+---
+title: "Data Cleaning"
+author: "Hannah Kim [106665360]"
+date: "2026-11-26"
+output:
+  pdf_document: default
+  html_document: default
+---
+```{r}
+#install.packages(c("dplyr", "readr", "stringr", "stringi",
+                   #"purrr", "lubridate", "jsonlite"))
+```
+
+
+```{r}
+library(dplyr)
+library(readr)
+library(stringr)
+library(stringi)
+library(purrr)
+library(lubridate)
+library(jsonlite)
+
+feature_cols <- c(
+  "popularity", "duration_ms", "explicit", "danceability", "energy", "key",
+  "loudness", "mode", "speechiness", "acousticness", "instrumentalness",
+  "liveness", "valence", "tempo", "time_signature", "track_genre"
+) #contains names of Spotify features
+
+#String manipulation
+normalize_text <- function(x) {
+  x |>
+    str_to_lower() |>
+    stri_trans_general("Latin-ASCII") |>
+    str_remove_all("\\s*[\\(\\[].*?[\\)\\]]") |>  
+    str_remove_all("\\s-\\s.*$") |>               
+    str_replace_all("&", "and") |>
+    str_remove_all("[^a-z0-9 ]") |>
+    str_squish()
+}
+
+make_key <- function(track, artist) {
+  paste(normalize_text(track), normalize_text(artist), sep = "||")
+}
+
+#Import files -- Used help from Claude
+read_streaming_history <- function(paths) {
+  needed <- c(
+    "ts", "ms_played", "master_metadata_track_name",
+    "master_metadata_album_artist_name", "master_metadata_album_album_name",
+    "spotify_track_uri", "skipped", "shuffle", "platform",
+    "reason_start", "reason_end"
+  )
+  map_dfr(paths, function(p) {
+    d <- as_tibble(fromJSON(p, flatten = TRUE))
+    d |>
+      select(any_of(needed)) |>
+      mutate(
+        across(everything(), as.character),  # avoid type clashes
+        # Video files hold mostly Wrapped stories / video loops
+        source = if_else(str_detect(basename(p), "Video"), "video", "audio")
+      )
+  })
+}
+
+#Clean history
+clean_history <- function(raw) {
+  raw |>
+    transmute( #Used Claude
+      played_at    = ymd_hms(ts, tz = "UTC"),
+      track_name   = master_metadata_track_name,
+      artist_name  = master_metadata_album_artist_name,
+      album_name   = master_metadata_album_album_name,
+      track_id     = str_extract(spotify_track_uri, "(?<=spotify:track:)[A-Za-z0-9]+"),
+      ms_played    = as.numeric(ms_played),
+      skipped      = as.logical(skipped),
+      shuffle      = as.logical(shuffle),
+      platform, reason_start, reason_end, source
+    ) |>
+    filter(!is.na(track_name), !is.na(artist_name), !is.na(played_at)) |>
+    distinct(played_at, track_name, artist_name, ms_played, .keep_all = TRUE) |>
+    mutate(
+      platform_clean = case_when( #Used Claude
+        str_detect(str_to_lower(platform), "^ios")        ~ "iOS",
+        str_detect(str_to_lower(platform), "^android")    ~ "Android",
+        str_detect(str_to_lower(platform), "^windows")    ~ "Windows",
+        str_detect(str_to_lower(platform), "^(os x|osx|mac)") ~ "macOS",
+        str_detect(str_to_lower(platform), "^web_player") ~ "Web player",
+        str_detect(str_to_lower(platform), "^partner")    ~ "Partner device",
+        TRUE                                              ~ "Other"
+      ), 
+      minutes_played = ms_played / 60000,
+      is_stream = ms_played >= 30000,   
+      date    = as_date(played_at),
+      year    = year(played_at),
+      month   = month(played_at, label = TRUE),
+      hour    = hour(played_at),
+      weekday = wday(played_at, label = TRUE, week_start = 1),
+      match_key = make_key(track_name, artist_name)
+    ) |>
+    arrange(played_at) |>
+    mutate(row_id = row_number(), .before = 1)
+}
+
+#Import data from Kaggle
+prep_kaggle <- function(path) {
+  k <- read_csv(path, show_col_types = FALSE) |>
+    select(-any_of(c("...1", "")))
+
+  k_by_id <- k |>
+    group_by(track_id) |>
+    summarize(
+      across(-track_genre, first),
+      track_genre = str_c(unique(track_genre), collapse = "; "),
+      .groups = "drop"
+    ) |>
+    mutate(match_key = make_key(track_name, str_split_i(artists, ";", 1)))
+
+  lookup_id <- k_by_id |> select(track_id, all_of(feature_cols))
+
+  lookup_name <- k_by_id |>
+    arrange(desc(popularity)) |>
+    distinct(match_key, .keep_all = TRUE) |>
+    select(match_key, all_of(feature_cols))
+
+  list(by_id = lookup_id, by_name = lookup_name)
+}
+
+#Merge history
+merge_history <- function(history, lookups) {
+  by_id <- history |>
+    inner_join(lookups$by_id, by = "track_id") |>
+    mutate(match_type = "track_id")
+
+  rest <- history |> anti_join(by_id, by = "row_id")
+
+  by_name <- rest |>
+    inner_join(lookups$by_name, by = "match_key") |>
+    mutate(match_type = "name")
+
+  unmatched <- rest |>
+    anti_join(by_name, by = "row_id") |>
+    mutate(match_type = "unmatched")
+
+  bind_rows(by_id, by_name, unmatched) |>
+    arrange(row_id) |>
+    select(-match_key)
+}
+
+#Data Analysis
+build_listening_dataset <- function(history_paths, kaggle_path, verbose = TRUE) {
+  history <- history_paths |> read_streaming_history() |> clean_history()
+  lookups <- prep_kaggle(kaggle_path)
+  out <- merge_history(history, lookups)
+
+  if (verbose) { #Used Claude
+    message("Plays after cleaning: ", nrow(out))
+    print(count(out, match_type) |> mutate(pct = round(100 * n / sum(n), 1)))
+  }
+  out
+}
+```
+
+```{r}
+files <- list.files(
+  "Spotify Extended Streaming History",
+  pattern = "Streaming_History_(Audio|Video).*\\.json$",
+  full.names = TRUE,
+  recursive = TRUE
+) #Used Claude for debugging
+
+length(files)
+```
+
+```{r}
+df <- build_listening_dataset(files, "dataset.csv")
+
+head(df)
+
+write.csv(df, "listening_data.csv")
+```
+
